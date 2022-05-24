@@ -1,0 +1,53 @@
+{
+    "type": "FeatureCollection",
+    "features": [
+        {
+            "type": "Feature",
+            "properties": {
+                "ACQ_DATE": "2021-07-01",
+                "ACQ_TIME": "0900",
+                "FIRENAME": "Dotta",
+                "CAUSE": "lightning"
+            },
+            "geometry": {
+                "type": "Point",
+                "coordinates": [
+                    -120.38148,
+                    39.92297
+                ]
+            }
+        },
+        {
+            "type": "Feature",
+            "properties": {
+                "ACQ_DATE": "2021-07-03",
+                "ACQ_TIME": "1006",
+                "FIRENAME": "Sugar",
+                "CAUSE": "lightning"
+            },
+            "geometry": {
+                "type": "Point",
+                "coordinates": [
+                    -120.34084,
+                    39.84729
+                ]
+            }
+        },
+        {
+            "type": "Feature",
+            "properties": {
+                "ACQ_DATE": "2021-07-14",
+                "ACQ_TIME": "1000",
+                "FIRENAME": "Dixie",
+                "CAUSE": "power line"
+            },
+            "geometry": {
+                "type": "Point",
+                "coordinates": [
+                    -121.37801,
+                    39.87371
+                ]
+            }
+        }
+    ]
+}

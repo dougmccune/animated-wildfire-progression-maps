@@ -1,1 +1,1 @@
-# animated-wildfire-progression-maps
+# Example of Creating an Animated Wildfire Progression Map Video

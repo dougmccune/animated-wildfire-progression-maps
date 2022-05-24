@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title></title>
+    <meta charset='utf-8'>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <link rel='stylesheet' href='node_modules/mapbox-gl/dist/mapbox-gl.css' />
+    
+    <!-- font used for rendering dates in the top left -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cabin:wght@600&display=swap" rel="stylesheet">
+
+    <style>
+        #map { 
+            width: 960px; 
+            height: 540px; 
+            /* places the interactive map offscreen so you can't accidentally click it and pan it manually */
+            position: absolute; left: -960px; top: -540px; 
+        }
+
+        .flip {
+            transform: scale(.5, -.5) translate(-50%, 50%);
+        }
+    </style>
+</head>
+
+<body>
+
+<div id='map'></div>
+
+<script src='https://api.mapbox.com/mapbox-gl-js/v2.8.2/mapbox-gl.js'></script>
+
+<!-- for parsing shapefiles -->
+<script src='https://unpkg.com/shapefile@0.6.6/dist/shapefile.min.js'></script>
+
+<!-- only used for getting the bounding box of the data -->
+<script src='https://unpkg.com/@turf/turf@6/turf.min.js'></script>
+
+<script type="module">
+
+/**
+ * 
+ * This code is heavily based off the video export example by Volodymyr Agafonkin
+ * https://github.com/mapbox/mapbox-gl-js/blob/main/debug/video-export.html
+ * 
+ */
+
+import loadEncoder from 'https://unpkg.com/mp4-h264@1.0.7/build/mp4-encoder.js';
+import {simd} from "https://unpkg.com/wasm-feature-detect?module";
+
+/**
+ * !!!!!!!!!
+ * YOU NEED YOUR OWN MAPBOX TOKEN
+ * !!!!!!!!!
+ */
+mapboxgl.accessToken = 'YOUR_TOKEN_HERE';
+
+// how long the final result video will be in milliseconds
+const animationDuration = 10000;
+
+// The fire data was downloaded from the NASA FIRMS archive download tool:
+// https://firms.modaps.eosdis.nasa.gov/download/
+const geojson = await shapefile.read("data/dixie_beckwourth.shp");
+
+// parse the string date and time for each point and convert to a proper JS date timestamp to make
+// filtering easier during the animation
+geojson.features.forEach(f=>{
+    const time = f.properties.ACQ_TIME;
+    f.properties.ACQ_DATE.setHours(time.substr(0,2), time.substr(2,2));
+    f.properties.TIMESTAMP = f.properties.ACQ_DATE.getTime();
+});
+
+// get a unique list of timestamps
+const timestamps = [...new Set(geojson.features.map(f=>f.properties.TIMESTAMP))];
+timestamps.sort();
+
+const lastRealTimestamp = timestamps[timestamps.length-1];
+
+// a day in milliseconds, used throughout the code for various animation timing things
+const oneDay = 86400000;
+
+// add a buffer to the animation by adding a timestamp that adds 30 days onto the end of the 
+// overall range, and 4 days to the beginning. That gives the animation a little time before the
+// points start to animate in and a bigger chunk of time at the end so the map will continue 
+// to rotate after the animation has completed. This was my lazy way of getting some buffers on 
+// either end of the animation. It would be nicer if you could specify the buffer durations you 
+// wanted in time, instead of "days", since each fire is a different duration.
+timestamps.push(lastRealTimestamp + (oneDay*30));
+timestamps.unshift(timestamps[0] - (oneDay*4));
+
+
+// point data to be used for fire labels
+const labelsGeojson = await fetch('data/fire-labels.geojson').then(r => r.json());
+labelsGeojson.features.forEach(f=>{
+    const time = f.properties.ACQ_TIME;
+    f.properties.ACQ_DATE = new Date(f.properties.ACQ_DATE);
+    f.properties.ACQ_DATE.setHours(time.substr(0,2), time.substr(2,2));
+    f.properties.TIMESTAMP = f.properties.ACQ_DATE.getTime();
+    f.properties.DATELABEL = f.properties.ACQ_DATE.toLocaleDateString(undefined, {month: 'short', day:'numeric'});
+});
+
+// figure out how to start the map view
+const bbox = turf.bbox(geojson);
+
+const startBearing = 0;
+const targetBearing = -20;
+
+const startPitch = 60;
+const targetPitch = 50;
+
+const map = window.map = new mapboxgl.Map({
+    container: 'map',
+    bounds: bbox,
+    pitch: targetPitch,
+    bearing: targetBearing,
+    style: 'mapbox://styles/mapbox/satellite-streets-v11'
+});
+
+// workaround for an issue with Mapbox's fitBounds method when using a bearing. See details below.
+map.fitBounds = fitBoundsFn.bind(map);
+
+map.fitBounds(bbox, { 
+    bearing: targetBearing 
+});
+
+const targetZoom = map.getZoom() + .4;
+const startZoom = targetZoom - .35;
+
+map.fitBounds(bbox, {
+    padding: { top: 0, bottom: 100, left: 0, right: 0 },
+    bearing: startBearing
+});
+
+map.jumpTo({
+    zoom: startZoom,
+    bearing: startBearing,
+    pitch: startPitch
+});
+
+
+// We can use SVG images as icons on the map, but we have to load
+// them first and register them with the mapbox library
+function loadIcon(file, iconName) {
+    let img = new Image(40,40)
+    img.onload = ()=> map.addImage(iconName, img)
+    img.src = file;
+}
+
+loadIcon('assets/lightning.svg', 'lightning');
+loadIcon('assets/powerline.svg', 'power line');
+
+async function animate() {
+    const start = performance.now();
+
+    // do all the animations you need to record here
+    map.easeTo({
+        bearing: targetBearing,
+        zoom: targetZoom,
+        pitch: targetPitch,
+        duration: animationDuration,
+        easing: t => t
+    });
+
+    // wait for animation to finish
+    await map.once('moveend');
+}
+
+map.on('load', async () => {
+    await setupMap();
+
+    // wait until the map settles
+    await map.once('idle');
+
+    await setupVideoRendering();
+});
+
+async function setupMap() {
+    // hide the road shields on the satellite basemap. They just get too busy and they change a lot during animations
+    map.setPaintProperty('road-number-shield', 'icon-opacity', 0);
+    map.setPaintProperty('road-number-shield', 'text-opacity', 0);
+
+    // this bumps up the satellite basemap layer saturation. Just personal preference. I like it. ¯\_(ツ)_/¯
+    map.setPaintProperty('satellite', 'raster-saturation', 0.5);
+
+    // terrain, used for hillshading
+    map.addSource('dem', {
+        type: 'raster-dem', 
+        url: 'mapbox://mapbox.mapbox-terrain-dem-v1'
+    });
+    
+    // fire starting point labels/icons
+    map.addSource('fire-labels', {
+        'type': 'geojson',
+        'data': labelsGeojson
+    });
+    
+    // The main geojson source of our timestamped point data
+    map.addSource('fire', {
+        'type': 'geojson',
+        'data': geojson
+    });
+
+    const layers = map.getStyle().layers;
+    // Find the index of the first symbol layer in the map style.
+    // This is used to put the hillshading under the symbols (but over the satellite imagery)
+    let firstSymbolId;
+    for (const layer of layers) {
+        if (layer.type === 'symbol') {
+            firstSymbolId = layer.id;
+            break;
+        }
+    }
+
+    // hillshading layer, underneath the symbol layer of the basemap (ie the city names)
+    // but it will be on top of the data layers. Putting it above the data layers makes the
+    // layers feel 3D
+    map.addLayer({
+        'id': 'hills',
+        'source': 'dem',
+        'type': 'hillshade',
+        "paint": {
+            "hillshade-illumination-anchor": 'viewport',
+            'hillshade-highlight-color': '#cccccc',
+            'hillshade-exaggeration': .7,
+            'hillshade-illumination-direction': 0,
+        }
+    },
+    firstSymbolId);
+
+    // Two layers for our fire points, one for the highlight and one for the main color.
+    // The highlight layer will be beneath, but with a larger radius so it sort of forms
+    // an outline around the areas that are actively burning.
+    map.addLayer({
+        'id': 'fire-layer-highlight',
+        'type': 'circle',
+        'source': 'fire',
+        'paint': {
+            'circle-radius': 7,
+            'circle-color': '#0afff7',
+            'circle-opacity': 0 // start invisible, then we'll change it programmatically
+        },
+    },
+    'hills');
+    
+    // The main fire layer
+    map.addLayer({
+        'id': 'fire-layer',
+        'type': 'circle',
+        'source': 'fire',
+        'paint': {
+            'circle-radius': 5,
+            'circle-blur': 1,
+            'circle-opacity': 0,
+        },
+    },
+    'hills');
+
+    // markers that show the fire name, cause, and start date
+    map.addLayer({
+        'id': 'fire-label-markers',
+        'type': 'symbol',
+        'source': 'fire-labels',
+        'layout': {
+            // rich text label using different font sizes and combination of bold and
+            // regular weight fonts. We're going for a label that is sort of like:
+            // *Dixie Fire*
+            // Started: *Jul 3*
+            // Cause: *power lines*
+            'text-field': [
+                'format',
+                ['concat', ['get', 'FIRENAME'], ' Fire'],
+                { 'font-scale': 1.3 },
+                '\n',
+                {},
+                ['literal', 'Started: '],
+                { 
+                    'font-scale': 1,
+                    'text-font': [
+                        'literal',
+                        ['Asap Medium Italic']
+                    ]
+                },
+                ['get', 'DATELABEL'],
+                { 
+                    'font-scale': 1 ,
+                    'text-font': [
+                        'literal',
+                        ['Asap Bold Italic']
+                    ]
+                },
+                '\n',
+                {},
+                ['literal', 'Cause: '],
+                { 
+                    'font-scale': 1,
+                    'text-font': [
+                        'literal',
+                        ['Asap Medium Italic']
+                    ]
+                },
+                ['get', 'CAUSE'],
+                { 
+                    'font-scale': 1,
+                    'text-font': [
+                        'literal',
+                        ['Asap Bold Italic']
+                    ]
+                },
+            ],
+            'text-font': [
+                'Lato Black Italic',
+                'Open Sans Semibold',
+                'Arial Unicode MS Bold'
+            ],
+            
+            'text-anchor': 'top',
+            'text-justify': 'auto',
+            'text-ignore-placement': false,
+            'text-allow-overlap': true,
+            'text-variable-anchor': ['right', 'bottom', 'left', 'top'],
+            'text-radial-offset': 1,
+            'text-size': 12,
+            'icon-image': ['get', 'CAUSE'], // the values in the label geojson file have to match the loaded icons
+            'icon-size': .5,
+            'icon-ignore-placement': true,
+            'icon-allow-overlap': true,
+            'icon-padding': 2,
+        },
+        'paint': {
+            'text-color': '#ffffff',
+            'text-halo-color': '#000000',
+            'text-halo-width': 1,
+            'text-halo-blur': 0,
+
+            // start invisible
+            'text-opacity': 0, 
+            'icon-opacity': 0,
+        }
+    });
+}
+
+function fillTextMultiLine(ctx, text, x, y, stroke) {
+  var lineHeight = ctx.measureText("M").width * 1.2;
+  var lines = text.split("\n");
+  for (var i = 0; i < lines.length; ++i) {
+    
+    if(stroke) 
+        ctx.strokeText(lines[i], x, y);
+    
+    ctx.fillText(lines[i], x, y);
+    y += lineHeight;
+  }
+}
+
+let lastLabelTimestamp = 0;
+
+function filterFireLabels(timestamp) {
+    if(timestamp != lastLabelTimestamp) {
+        const fadeDuration = oneDay * 10;
+        const expression = ['max', ['min', ['/', ['-', timestamp, ['get', 'TIMESTAMP'] ], fadeDuration], 1], 0];
+
+        map.setPaintProperty('fire-label-markers', 'text-opacity', expression);
+        map.setPaintProperty('fire-label-markers', 'icon-opacity', expression);
+
+        lastLabelTimestamp = timestamp;
+    }
+}
+
+async function setupVideoRendering() {
+    // don't forget to enable WebAssembly SIMD in chrome://flags for faster encoding
+    const supportsSIMD = await simd();
+
+    // initialize H264 video encoder
+    const Encoder = await loadEncoder({simd: supportsSIMD});
+
+    const gl = map.painter.context.gl;
+    const width = gl.drawingBufferWidth;
+    const height = gl.drawingBufferHeight;
+
+    const fps = 60;
+
+    const encoder = Encoder.create({
+        width,
+        height,
+        fps: fps,
+        kbps: 64000,
+        rgbFlipY: true
+    });
+
+    // stub performance.now for deterministic rendering per-frame (only available in dev build)
+    let now = performance.now();
+    let startTime = now;
+    mapboxgl.setNow(now);
+
+    const ptr = encoder.getRGBPointer(); // keep a pointer to encoder WebAssembly heap memory
+
+    // create a canvas that will be used to render the text overlays on top of the 
+    // map animation
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    canvas.className = 'flip';
+
+    const ctx = canvas.getContext("2d");
+    ctx.translate(0,height); 
+    ctx.scale(1,-1);
+    ctx.strokeStyle = 'black';
+    ctx.fillStyle = 'white';
+    ctx.font = "70px 'Cabin'";
+    ctx.lineWidth = 6;
+
+    document.body.appendChild(canvas);
+
+    let frameCount = 0;
+
+    let lastText = '';
+    let lastTextTimestamp = 0;
+
+    const firstTimestamp = timestamps[0];
+
+    function frame() {
+
+        mapboxgl.setNow(now);
+        
+        let pct = (now - startTime) / animationDuration;
+
+        const curTimestamp = firstTimestamp + ((timestamps[timestamps.length-1] - firstTimestamp)*pct);
+
+        var closestTimestamp = timestamps[0];
+        for(let i=0; i<timestamps.length; i++) {
+            if(timestamps[i] > curTimestamp)
+                break;
+
+            closestTimestamp = timestamps[i];
+        }
+
+        if(curTimestamp >= lastRealTimestamp)
+            closestTimestamp = 0;
+
+        filterFireLabels(curTimestamp);
+
+        map.setPaintProperty('fire-layer-highlight', 'circle-opacity', [
+            'interpolate',
+            ['linear'],
+            ['get', 'TIMESTAMP'],
+            closestTimestamp - (oneDay * 2),
+            0,
+            closestTimestamp,
+            0.6,
+            closestTimestamp+1,
+            0,
+        ]);
+
+        map.setPaintProperty('fire-layer-highlight', 'circle-blur', [
+            'case',
+            ['==', ['get', 'TIMESTAMP'], closestTimestamp ],
+            .1,
+            ['all', ['>', ['get', 'TIMESTAMP'], closestTimestamp - (oneDay * 1) ], ['<', ['get', 'TIMESTAMP'], closestTimestamp ]],
+            .5,
+            0
+        ]);
+
+        map.setPaintProperty('fire-layer', 'circle-color', [
+            'interpolate-hcl',
+            ['linear'],
+            ['get', 'TIMESTAMP'],
+            curTimestamp - (oneDay * 5),
+            '#222222',
+            curTimestamp - (oneDay * 4),
+            '#800026',
+            curTimestamp - (oneDay * 3),
+            '#bd0026',
+            curTimestamp - (oneDay * 2),
+            '#e31a1c',
+            curTimestamp - oneDay,
+            '#fc4e2a'
+        ]);
+
+        map.setPaintProperty('fire-layer', 'circle-opacity', 
+        [
+            'interpolate',
+            ['linear'],
+            ['get', 'TIMESTAMP'],
+            curTimestamp - (oneDay * 4) - 1,
+            1,
+            curTimestamp - (oneDay * 4),
+            .2,
+            curTimestamp - oneDay,
+            .5,
+            curTimestamp + 1,
+            0
+        ]);
+        
+        map.setPaintProperty('hills', 'hillshade-illumination-direction', pct * 180);
+        
+        
+
+
+        
+
+        
+        /**
+        * It would be great if we could force all layers to re-render fully every frame,
+        * but Mapbox GL is designed to optimize for keeping a steady framerate for a smooth
+        * end user experience. So Mapbox uses a render queue mechanism and there are no
+        * garauntees as to when your map layers will get re-rendered after you call setFilter
+        * or setPaintProperty. That means that if we simply try to filter or style our layers 
+        * uniquely every single frame, the rendering will lag significantly behind our 
+        * animation, and by the time the animation is done, the map layers will still have
+        * a bunch of render cycles left to "catch up". 
+        *
+        * There's a discussion of a feature request for a synchronous rendering capability:
+        * https://github.com/mapbox/mapbox-gl-js/issues/7893
+        *
+        * But since we don't have a way to flush the cache and force re-render all the layers 
+        * programmatically, instead what we'll do is allow MapboxGL to render extra frames before 
+        * advancing the time of the animation. Note that we aren't encoding those extra frames to 
+        * the video, we're just trying to give the layers time to fully update, then we encode 
+        * a single frame to the video once we think/hope all the layers are rendered. I've had to use
+        * various different values for the extra frame value, depending on the complexity of the 
+        * data I'm mapping. Sometimes a value as low as 4 works OK, sometimes as high as 20 is needed.
+        * Yor mileage may vary.
+        */
+        const extraFrames = 20;
+
+        if(frameCount++ % extraFrames == 0) {
+            now += 1000 / fps;
+
+            const w = gl.drawingBufferWidth;
+            const h = gl.drawingBufferHeight;
+
+            const pixelData = new Uint8Array(w * h * 4);
+            gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixelData);
+
+            const imageData = new ImageData(Uint8ClampedArray.from(pixelData), w, h);
+            ctx.putImageData(imageData, 0, 0);
+
+            
+            
+            // If you want extra text overlaid on top of your map, you can add more lines here.
+            // Sometimes I like putting the fire name in here, but in this example I'm using
+            // labels on the map to label multiple fires instead.
+            const labelLines = [];
+            
+            // if we render updated date text to the video every frame the text will be changing
+            // so rapidly you won't be able to read it. So we intentionaly slow it down and only 
+            // update every 300ms
+            if(now - lastTextTimestamp >= 300) {
+                const dateTimestamp = Math.min(curTimestamp, lastRealTimestamp);
+                const dateText = new Date(dateTimestamp).toLocaleString(undefined, {year: 'numeric', month: 'short', day: 'numeric'});
+                
+                labelLines.push(dateText);
+                
+                lastText = labelLines.join('\n');
+
+                lastTextTimestamp = now;
+            }
+
+            fillTextMultiLine(ctx, lastText, 30, 100, true);
+
+            
+            // play nice and give attribution. Feel free to remove my name :) but please keep the OSM and MapBox attribution, since
+            // that's required by their licenses
+            const copyrightText = 'Map imagery © OpenStreetMap © MapBox. Fire data from NASA FIRMS. Code by Doug McCune.';
+
+            ctx.save();
+            ctx.font = "24px 'Arial'";
+            ctx.shadowColor = '#000000';
+            ctx.shadowBlur = 5;
+            ctx.shadowOffsetX = 0;
+            ctx.shadowOffsetY = 0;
+
+            ctx.fillText(copyrightText, 30, canvas.height - 30);
+
+            ctx.restore();
+            
+            const newImageData = ctx.getImageData(0,0,w,h);
+            const pixels = encoder.memory().subarray(ptr); // get a view into encoder memory
+            pixels.set(newImageData.data)
+
+            encoder.encodeRGBPointer(); // encode the frame
+        }
+    }
+
+    map.on('render', frame); // set up frame-by-frame recording
+
+    await animate(); // run all the animations
+
+    // stop recording
+    map.off('render', frame);
+    mapboxgl.restoreNow();
+
+    
+    const mp4 = encoder.end();
+    const anchor = document.createElement("a");
+    anchor.href =  URL.createObjectURL(new Blob([mp4], {type: "video/mp4"}));
+    anchor.download = "fire-progression";
+    anchor.click();
+
+    // make sure to run `ffmpeg -i mapbox-gl.mp4 mapbox-gl-optimized.mp4` to compress the video
+}
+
+
+/**
+ * This is a workaround for an issue with the fitBounds function. The default behavior is that the
+ * map will not respect the bearing correctly when you call fitBounds, so if you are using a custom
+ * bearing, then you might end up with some of your data off-screen after calling fitBounds. This
+ * workaround patches that and is important for us to be able to get good start and end camera views
+ * for our animation that ensure that all the data is always visible.
+ *
+ * Code by Dag Jomar Mersland. Source:
+ * https://github.com/mapbox/mapbox-gl-js/issues/1338#issuecomment-331009940
+ */
+function fitBoundsFn( bounds, options, eventData ) {
+
+    options = Object.assign({
+        padding: {
+            top: 0,
+            bottom: 0,
+            right: 0,
+            left: 0
+        },
+        offset: [0, 0],
+        maxZoom: this.transform.maxZoom
+    }, options);
+
+    if (typeof options.padding === 'number') {
+        const p = options.padding;
+        options.padding = {
+            top: p,
+            bottom: p,
+            right: p,
+            left: p
+        };
+    }
+
+    bounds = mapboxgl.LngLatBounds.convert(bounds);
+
+    // we separate the passed padding option into two parts, the part that does not affect the map's center
+    // (lateral and vertical padding), and the part that does (paddingOffset). We add the padding offset
+    // to the options `offset` object where it can alter the map's center in the subsequent calls to
+    // `easeTo` and `flyTo`.
+    const paddingOffset = [options.padding.left - options.padding.right, options.padding.top - options.padding.bottom],
+        lateralPadding = Math.min(options.padding.right, options.padding.left),
+        verticalPadding = Math.min(options.padding.top, options.padding.bottom);
+    options.offset = [options.offset[0] + paddingOffset[0], options.offset[1] + paddingOffset[1]];
+
+    options.bearing = options.bearing || this.getBearing();
+
+    const offset = mapboxgl.Point.convert(options.offset),
+        tr = this.transform,
+        nw = tr.project(bounds.getNorthWest()),
+        se = tr.project(bounds.getSouthEast()),
+        size = se.sub(nw);
+
+        /** START CUSTOM ROTATION HACK **/
+        // Now using a "cropped rectangle" rotation method
+        // https://stackoverflow.com/questions/33866535/how-to-scale-a-rotated-rectangle-to-always-fit-another-rectangle
+        // W = w·|cos φ| + h·|sin φ|
+        // H = w·|sin φ| + h·|cos φ|
+        const theta = options.bearing * (Math.PI/180),
+            W = size.x * Math.abs( Math.cos(theta) ) + size.y * Math.abs( Math.sin(theta) ),
+            H = size.x * Math.abs( Math.sin(theta) ) + size.y * Math.abs( Math.cos(theta) ),
+            rotatedSize = {x: W, y: H},
+        /** END CUSTOM ROTATION HACK **/
+
+            scaleX = (tr.width - lateralPadding * 2 - Math.abs(offset.x) * 2) / rotatedSize.x,
+            scaleY = (tr.height - verticalPadding * 2 - Math.abs(offset.y) * 2) / rotatedSize.y;
+
+    if (scaleY < 0 || scaleX < 0) {
+        if (typeof console !== "undefined") console.warn('Map cannot fit within canvas with the given bounds, padding, and/or offset.');
+        return this;
+    }
+
+    options.center = tr.unproject(nw.add(se).div(2));
+    options.zoom = Math.min(tr.scaleZoom(tr.scale * Math.min(scaleX, scaleY)), options.maxZoom);
+
+
+    this.jumpTo(options, eventData);
+}
+
+
+
+</script>
+</body>
+</html>
